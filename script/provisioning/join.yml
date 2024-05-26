@@ -1,0 +1,35 @@
+---
+- name: Setup swarm manager
+  hosts: swarm_manager
+  become: yes
+  tasks:
+    - name: Obtain worker join token
+      shell: docker swarm join-token -q worker
+      register: worker_join_token
+    
+    - name: Remove stack if exists
+      shell: docker stack rm milestone_3
+      ignore_errors: yes
+
+- name: Join new server
+  hosts: swarm_workers
+  tasks:
+    - name: Leave the swarm
+      shell: docker swarm leave --force
+      retries: 5
+      delay: 3
+
+    - name: Join the swarm
+      shell: docker swarm join --token {{ hostvars[groups['swarm_manager'][0]].worker_join_token.stdout }} {{ hostvars[groups['swarm_manager'][0]].ansible_default_ipv4.address }}:2377
+      retries: 5
+      delay: 3
+
+- name: Deploy the stack
+  hosts: swarm_manager
+  vars:
+    milestone: milestone_3
+  tasks:
+    - name: Deploy the stack
+      shell: docker stack deploy -c /root/project/stack.prod.yml {{ milestone }}
+      args:
+        chdir: /root/project

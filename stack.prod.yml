@@ -1,0 +1,320 @@
+networks:
+  agent_network:
+    driver: overlay
+    attachable: true
+  monitor-net:
+
+volumes:
+  osm-data:
+    external: true
+  mongo-data:
+  mongo-config:
+  portainer-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+
+x-logging-options: &logging
+  logging:
+    driver: 'fluentd'
+    options:
+      tag: '{{.Name}}'
+      fluentd-address: 127.0.0.1:24224
+      fluentd-async-connect: 'true'
+
+services:
+  nginx:
+    image: ktao87/cse356:nginx
+    ports:
+      - '80:80'
+    volumes:
+      - /var/cache/tiles:/var/cache/tiles
+    depends_on:
+      - frontend
+      - backend
+      - search
+      - tile-server
+    <<: *logging
+    ulimits:
+      nofile:
+        soft: 20000
+        hard: 40000
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 3GB
+        reservations:
+          cpus: '2'
+          memory: 2GB
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+        delay: 5s
+      placement:
+        constraints:
+          - node.role == manager
+
+  fluentd:
+    image: ktao87/cse356:fluentd
+    ports:
+      - '24224:24224'
+      - '24224:24224/udp'
+    networks:
+      - monitor-net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+
+  frontend:
+    image: ktao87/cse356:frontend
+    depends_on:
+      - fluentd
+      - backend
+      - search
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: none
+      placement:
+        constraints:
+          - node.role == manager
+
+  backend:
+    image: ktao87/cse356:backend
+    depends_on:
+      - mongo
+      - db
+      - route-cache
+    ports:
+      - '3000:3000'
+    extra_hosts:
+      host.docker.internal: host-gateway
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1GB
+        reservations:
+          cpus: '1'
+          memory: 0.5GB
+      placement:
+        constraints:
+          - node.hostname == backend
+
+  route-cache:
+    image: bitnami/memcached:latest
+    environment:
+      - MEMCACHED_CACHE_SIZE=1024 #1G
+      - MEMCACHED_MAX_ITEM_SIZE=31457280 #in bytes
+      - MEMCACHED_THREADS=1
+    command: /opt/bitnami/scripts/memcached/run.sh
+    ports:
+      - 11211:11211
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.hostname == backend
+
+  mongo:
+    image: mongo:latest
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: 'root'
+      MONGO_INITDB_ROOT_PASSWORD: 'password'
+      MONGO_INITDB_DATABASE: 'user'
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  tile-server:
+    image: ktao87/cse356:tile-server
+    ports:
+      - '8080:80'
+    volumes:
+      - /var/cache/tiles:/var/cache/tiles
+    <<: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 7.5GB
+        reservations:
+          cpus: '4'
+          memory: 6GB
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.hostname == tile-server
+
+  search:
+    image: ktao87/cse356:search
+    depends_on:
+      - db
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  db:
+    image: ktao87/cse356:db
+    volumes:
+      - osm-data:/var/lib/postgresql/14/main
+      - /backup:/backup
+      - type: tmpfs
+        target: /dev/shm
+        tmpfs:
+          size: 2048000000 # 2gb
+    <<: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 7.5GB
+        reservations:
+          cpus: '4'
+          memory: 6GB
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.hostname == db
+
+  agent:
+    image: portainer/agent:2.19.4
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - agent_network
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.platform.os == linux
+
+  portainer:
+    image: portainer/portainer-ce:2.19.4
+    command: -H tcp://tasks.agent:9001 --tlsskipverify
+    ports:
+      - '9443:9443'
+      - '9000:9000'
+      - '8000:8000'
+    volumes:
+      - portainer-data:/data
+    networks:
+      - agent_network
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  prometheus:
+    image: ktao87/cse356:prometheus
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      - monitor-net
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.hostname==monitor
+
+  node-exporter:
+    image: stefanprodan/swarmprom-node-exporter:v0.16.0
+    environment:
+      - NODE_ID={{.Node.ID}}
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /etc/hostname:/etc/nodename:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.textfile.directory=/etc/node-exporter/'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--no-collector.ipvs'
+    networks:
+      - monitor-net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - 8088:8080
+    networks:
+      - monitor-net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+
+  grafana:
+    image: ktao87/cse356:grafana
+    depends_on:
+      - prometheus
+    ports:
+      - 7777:3000
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - monitor-net
+    user: '472'
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.hostname==monitor
+
+  loki:
+    image: ktao87/cse356:loki
+    networks:
+      - monitor-net
+    volumes:
+      - loki-data:/src/loki
+    user: '0'
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.hostname==monitor

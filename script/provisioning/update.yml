@@ -1,0 +1,34 @@
+---
+- name: Prepare docker images
+  hosts: swarm_manager
+  tasks:
+    - name: Build the Docker image
+      local_action: ansible.builtin.command docker compose -f "{{ playbook_dir }}/../../docker-compose.prod.yml" build
+      retries: 5
+    - name: Push the Docker image
+      local_action: ansible.builtin.command docker compose -f "{{ playbook_dir }}/../../docker-compose.prod.yml" push
+      retries: 5
+
+- name: Update the project
+  hosts: swarm_manager
+  become: yes
+  vars:
+    project_branch: main
+    milestone: milestone_3
+
+  tasks:
+    - name: Pull the new change from the remote repo
+      git:
+        repo: 'git@github.com:goodgoed/CSE356_project.git'
+        dest: '/root/project'
+        accept_hostkey: yes
+        key_file: '~/.ssh/github'
+        force: yes
+
+    - name: Switch to another branch
+      shell: git switch {{ project_branch }}
+      args:
+        chdir: '/root/project'
+
+    - name: Deploy stack to Docker Swarm
+      shell: docker stack deploy -d -c /root/project/stack.prod.yml {{ milestone }}

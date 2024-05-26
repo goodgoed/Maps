@@ -1,0 +1,10 @@
+logs/**
+cache/**
+.venv
+.DS_Store
+node_modules
+backup/**
+tile-server-cache.tar.gz
+script/provisioning/fdt.jar
+.venv
+nginx-cache.tar.gz

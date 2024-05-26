@@ -1,0 +1,271 @@
+networks:
+  agent_network:
+    driver: overlay
+    attachable: true
+  monitor-net:
+
+volumes:
+  cse356_project_osm-data:
+    external: true
+  mongo-data:
+  mongo-config:
+  portainer-data:
+  tile-server-cache:
+  prometheus-data:
+  nginx-route-cache:
+  # grafana-data:
+  loki-data:
+
+x-logging-options: &logging
+  logging:
+    driver: 'fluentd'
+    options:
+      tag: '{{.Name}}'
+      fluentd-address: 127.0.0.1:24224
+      fluentd-async-connect: 'true'
+
+services:
+  nginx:
+    build:
+      context: ./docker/nginx/
+      dockerfile: ./nginx.Dockerfile
+    image: ktao87/cse356:nginx
+    ports:
+      - '80:80'
+    volumes:
+      - ./nginx-cache.tar.gz:/nginx-cache.tar.gz
+      - nginx-route-cache:/var/cache/api
+    depends_on:
+      - frontend
+      - backend
+      - search
+      - tile-server
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+        delay: 5s
+
+  fluentd:
+    build:
+      context: ./docker/fluentd/
+      dockerfile: ./fluentd.Dockerfile
+    image: fluentd:dev
+    ports:
+      - '24224:24224'
+      - '24224:24224/udp'
+    networks:
+      - monitor-net
+    deploy:
+      mode: global
+
+  frontend:
+    build:
+      context: ./frontend/
+      dockerfile: ../docker/frontend/frontend.dev.Dockerfile
+    image: frontend:dev
+    depends_on:
+      - fluentd
+      - backend
+      - search
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  backend:
+    build:
+      context: ./backend/
+      dockerfile: ../docker/backend/backend.dev.Dockerfile
+    image: backend:dev
+    depends_on:
+      - mongo
+      - db
+      - route-cache
+    extra_hosts:
+      host.docker.internal: host-gateway
+    volumes:
+      - ./backend/routes:/app/routes
+      - ./backend/server.js:/app/server.js
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  route-cache:
+    image: bitnami/memcached:latest
+    environment:
+      - MEMCACHED_CACHE_SIZE=8000 # 3.5GB
+      - MEMCACHED_MAX_ITEM_SIZE=31457280 #in bytes
+      - MEMCACHED_THREADS=2
+    command: /opt/bitnami/scripts/memcached/run.sh -v
+    ports:
+      - 11211:11211
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  mongo:
+    image: mongo:latest
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: 'root'
+      MONGO_INITDB_ROOT_PASSWORD: 'password'
+      MONGO_INITDB_DATABASE: 'user'
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  tile-server:
+    build:
+      context: ./docker/tile-server/
+      dockerfile: ./tile.Dockerfile
+    image: tile-server:dev
+    ports:
+      - 8080:80
+    volumes:
+      - tile-server-cache:/var/cache/tiles
+    <<: *logging
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  search:
+    build:
+      context: ./search
+      dockerfile: ../docker/search/search.Dockerfile
+    image: search:dev
+    depends_on:
+      - db
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  db:
+    build:
+      context: ./docker/db/
+      dockerfile: ./db.Dockerfile
+    image: db:dev
+    volumes:
+      - cse356_project_osm-data:/var/lib/postgresql/14/main
+      - ./backup:/backup
+    shm_size: 2gb
+    <<: *logging
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  agent:
+    image: portainer/agent:2.19.4
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - agent_network
+    deploy:
+      mode: global
+
+  portainer:
+    image: portainer/portainer-ce:2.19.4
+    command: -H tcp://tasks.agent:9001 --tlsskipverify
+    ports:
+      - '9443:9443'
+      - '9000:9000'
+      - '8000:8000'
+    volumes:
+      - portainer-data:/data
+    networks:
+      - agent_network
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  prometheus:
+    build:
+      context: ./docker/prometheus/
+      dockerfile: ./prometheus.Dockerfile
+    image: prometheus:dev
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      - monitor-net
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  node-exporter:
+    image: prom/node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - --collector.filesystem.ignored-mount-points
+      - '^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)'
+    ports:
+      - 9100:9100
+    networks:
+      - monitor-net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.1 # m1/m2 mac
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /etc/machine-id:/etc/machine-id:ro
+    ports:
+      - 8088:8080
+    networks:
+      - monitor-net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+
+  grafana:
+    build:
+      context: ./docker/grafana/
+      dockerfile: ./grafana.Dockerfile
+    image: grafana:dev
+    depends_on:
+      - prometheus
+    ports:
+      - 3000:3000
+    # volumes:
+    #   - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - monitor-net
+    user: '472'
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  loki:
+    build:
+      context: ./docker/loki/
+      dockerfile: ./loki.Dockerfile
+    image: loki:dev
+    user: '0'
+    networks:
+      - monitor-net
+    volumes:
+      - loki-data:/tmp/loki

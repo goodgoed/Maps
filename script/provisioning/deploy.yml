@@ -1,0 +1,182 @@
+---
+- name: Prepare docker images
+  hosts: swarm_manager
+  tasks:
+    - name: Build the Docker image
+      local_action: ansible.builtin.command docker compose -f "{{ playbook_dir }}/../../docker-compose.prod.yml" build
+      retries: 5
+    - name: Push the Docker image
+      local_action: ansible.builtin.command docker compose -f "{{ playbook_dir }}/../../docker-compose.prod.yml" push
+      retries: 5
+
+- name: Setup VMs
+  hosts: all
+  become: yes
+  tasks:
+    - name: Kill /var/lib/dpkg/lock-frontend process if exists
+      shell: kill -9 $(lsof -t /var/lib/dpkg/lock-frontend)
+      ignore_errors: true
+    
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - python3-setuptools
+        state: latest
+        update_cache: true
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+
+    - name: Kill /var/lib/dpkg/lock-frontend process if exists
+      shell: kill -9 $(lsof -t /var/lib/dpkg/lock-frontend)
+      ignore_errors: true
+
+    - name: Update apt and install docker-ce
+      apt:
+        name: docker-ce
+        state: latest
+        update_cache: true
+
+    - name: Ensure Docker daemon is running
+      service:
+        name: docker
+        state: started
+
+- name: Setting up mail server
+  hosts: backend
+  become: yes
+  tasks:
+    - name: Install postfix
+      apt:
+        name: postfix
+        state: latest
+        update_cache: yes
+    - name: Setup myhostname
+      shell: postconf -e 'myhostname = mygroop.cse356.compas.cs.stonybrook.edu'
+    - name: Setup mydomain
+      shell: postconf -e 'mydomain = cse356.compas.cs.stonybrook.edu'
+    - name: Setup myorigin
+      shell: postconf -e 'myorigin = $mydomain'
+    - name: Setup mynetworks
+      shell: postconf -e 'mynetworks = 0.0.0.0/0'
+    - name: Restart postfix
+      shell: systemctl restart postfix
+    - name: Run iptables rule for sending email
+      shell: ip6tables -I OUTPUT -p tcp -m tcp --dport 25 -j DROP && iptables -t nat -I OUTPUT -o eth0 -p tcp -m tcp --dport 25 -j DNAT --to-destination 130.245.171.151:11587
+
+- name: Clone the git repository
+  hosts: swarm_manager
+  become: yes
+  vars:
+    project_branch: main
+  tasks:
+    - name: Install git
+      apt:
+        name:
+          - git
+        state: latest
+        update_cache: yes
+    - name: Copy private SSH key
+      copy:
+        src: './github'
+        dest: '~/.ssh/github'
+        mode: '0600' # Sets the file permissions to read and write for the owner only
+
+    - name: Clone the repository
+      git:
+        repo: 'git@github.com:goodgoed/CSE356_project.git'
+        dest: '/root/project'
+        accept_hostkey: yes
+        key_file: '~/.ssh/github'
+        force: yes
+
+    - name: Checkout to the branch
+      shell: git checkout {{ project_branch }}
+      args:
+        chdir: /root/project
+
+- name: Setup Docker Swarm Manager
+  hosts: swarm_manager
+  become: yes
+  tasks:
+    - name: Check if Docker is in swarm mode
+      shell: docker info --format '{{'{{'}}.Swarm.LocalNodeState{{'}}'}}'
+      register: swarm_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Initialize Docker Swarm
+      shell: docker swarm init --advertise-addr {{ hostvars[groups['swarm_manager'][0]].ansible_default_ipv4.address }}
+      when: swarm_status.stdout != 'active'
+
+    - name: Obtain worker join token
+      shell: docker swarm join-token -q worker
+      register: worker_join_token
+
+- name: Change hostname of all servers
+  hosts: all
+  become: yes
+  tasks:
+    - name: Change hostname
+      ansible.builtin.hostname:
+        name: '{{ custom_hostname }}'
+      ignore_errors: true
+
+- name: Create a cache directory for tile server
+  hosts: tileserver
+  become: yes
+  tasks:
+    - name: Create cache directory
+      file:
+        path: /var/cache/tiles
+        state: directory
+        mode: 0777
+
+- name: Setup Docker Swarm Worker Nodes
+  hosts: swarm_workers
+  become: yes
+  tasks:
+    - name: Join the swarm
+      shell: docker swarm join --token {{ hostvars[groups['swarm_manager'][0]].worker_join_token.stdout }} {{ hostvars[groups['swarm_manager'][0]].ansible_default_ipv4.address }}:2377
+      ignore_errors: true
+
+- name: Deploy Services to Swarm
+  hosts: swarm_manager
+  become: yes
+  vars:
+    milestone: milestone_3
+  tasks:
+    - name: Enable docker.service
+      systemd:
+        name: docker.service
+        daemon_reload: true
+        enabled: true
+
+    - name: Check hostname of workers are changed
+      shell: docker node ls | grep "{{ hostvars[worker]['custom_hostname'] }}"
+      delegate_to: "{{ groups['swarm_manager'][0] }}"
+      loop: "{{ groups['swarm_workers'] }}"
+      loop_control:
+        loop_var: worker
+      register: grep_output
+      retries: 5
+      delay: 3
+      until: grep_output.stdout != ""
+    
+    - name: Deploy the stack
+      shell: docker stack deploy -d -c /root/project/stack.prod.yml {{ milestone }}
+      args:
+        chdir: /root/project

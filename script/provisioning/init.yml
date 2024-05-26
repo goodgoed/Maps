@@ -1,0 +1,58 @@
+---
+- name: Setup VMs
+  hosts: main:db
+  become: yes
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - python3-setuptools
+        state: latest
+        update_cache: true
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+
+    - name: Kill /var/lib/dpkg/lock-frontend process if exists
+      shell: kill -9 $(lsof -t /var/lib/dpkg/lock-frontend)
+      ignore_errors: true
+
+    - name: Update apt and install docker-ce
+      apt:
+        name: docker-ce
+        state: latest
+        update_cache: true
+
+    - name: Ensure Docker daemon is running
+      service:
+        name: docker
+        state: started
+    
+    - name: Install Java
+      apt:
+        name: default-jre
+        state: latest
+        update_cache: yes
+
+    - name: Install FDT
+      shell: curl -L https://github.com/fast-data-transfer/fdt/releases/download/0.26.3/fdt.jar -o fdt.jar
+
+    - name: Run FDT
+      shell: nohup java -jar ./fdt.jar -S &
+
+    - name: Run init script
+      debug:
+        msg: "Running the script: ./init.sh {{ groups['db'][0] }} {{ groups['main'][0] }} "

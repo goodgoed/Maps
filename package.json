@@ -1,0 +1,16 @@
+{
+  "name": "final",
+  "version": "1.0.0",
+  "description": "Root Directory",
+  "lint-staged": {
+    "*.{js,jsx,ts,tsx,yml}": "prettier --write"
+  },
+  "dependencies": {
+    "prettier": "3.2.5",
+    "husky": "^9.0.11",
+    "lint-staged": "^15.2.2"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
